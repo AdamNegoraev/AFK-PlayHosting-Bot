@@ -1125,6 +1125,24 @@ setInterval(
 );
 
 // ============================================================
+// EVENT LOOP LAG WATCHDOG
+// Detects if the event loop is blocked (e.g. by pathfinder A*)
+// and force-reconnects to prevent keepalive timeout kicks.
+// ============================================================
+let lastWatchdogTick = Date.now();
+setInterval(() => {
+  const now = Date.now();
+  const lag = now - lastWatchdogTick - 5000;
+  lastWatchdogTick = now;
+  if (lag > 20000 && bot && botState.connected) {
+    addLog(`[Watchdog] Event loop lag of ${(lag / 1000).toFixed(1)}s detected — forcing reconnect`);
+    try { bot.removeAllListeners(); bot.end(); } catch (e) {}
+    bot = null;
+    scheduleReconnect();
+  }
+}, 5000);
+
+// ============================================================
 // BOT CREATION WITH RECONNECTION LOGIC
 // ============================================================
 // ============================================================
@@ -1656,7 +1674,7 @@ function startCircleWalk(bot, defaultMove) {
   addInterval(() => {
     if (!bot || !botState.connected) return;
     const now = Date.now();
-    if (now - lastPathTime < 2000) return;
+    if (now - lastPathTime < 10000) return;
     lastPathTime = now;
     try {
       const x = bot.entity.position.x + Math.cos(angle) * radius;
