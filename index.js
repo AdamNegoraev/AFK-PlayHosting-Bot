@@ -1225,6 +1225,22 @@ function createBot() {
 
     bot.loadPlugin(pathfinder);
 
+    // FIX: auto-accept forced resource packs during configuration phase
+    // Without this, the server waits for a response and never sends finish_configuration,
+    // leaving the bot stuck in config limbo until GrimAC kicks for timeout.
+    // We intercept the raw packet directly because:
+    // 1. bot.acceptResourcePack() sends TWO packets (ACCEPTED + SUCCESSFULLY_LOADED)
+    //    which confuses Paper 1.21+ task system
+    // 2. The "resourcePack" event wraps the UUID in a uuid-1345 object that doesn't
+    //    serialize correctly in the response packet
+    bot._client.on("add_resource_pack", (data) => {
+      addLog(`[Bot] Resource pack received (uuid: ${data.uuid}), auto-accepting...`);
+      bot._client.write("resource_pack_receive", {
+        uuid: String(data.uuid),
+        result: 0,
+      });
+    });
+
     // FIX: connection timeout - end the old bot before reconnecting to avoid ghost bots
     clearBotTimeouts();
     connectionTimeoutId = setTimeout(() => {
