@@ -9,7 +9,6 @@ const express = require("express");
 const http = require("http");
 const https = require("https");
 const net = require("net");
-const dns = require("dns");
 
 // ============================================================
 // EXPRESS SERVER - Keep Render/Aternos alive
@@ -27,7 +26,6 @@ let botState = {
   errors: [],
   wasThrottled: false,
   consecutiveTimeouts: 0,
-  lastResolvedIP: null,
 };
 
 // Health check endpoint for monitoring
@@ -1051,13 +1049,11 @@ app.post("/command", express.json(), (req, res) => {
     addLog("[Console] Running connectivity check...");
     const host = config.server.ip;
     const port = config.server.port;
-    resolveHost(host)
-      .then((ip) => {
-        return checkConnectivity(ip, port, 10000).then((result) => {
-          const msg = `Reachable: ${result.host}:${result.port} (${result.latency}ms) | IP: ${ip}`;
-          addLog(`[Console] ${msg}`);
-          return res.json({ success: true, msg });
-        });
+    checkConnectivity(host, port, 10000)
+      .then((result) => {
+        const msg = `Reachable: ${result.host}:${result.port} (${result.latency}ms)`;
+        addLog(`[Console] ${msg}`);
+        return res.json({ success: true, msg });
       })
       .catch((err) => {
         const msg = `UNREACHABLE: ${host}:${port} — ${err.message}`;
@@ -1069,7 +1065,6 @@ app.post("/command", express.json(), (req, res) => {
 
   if (cmd === "/debug") {
     const lines = [
-      `Resolved IP: ${botState.lastResolvedIP || "none"}`,
       `Consecutive timeouts: ${botState.consecutiveTimeouts}`,
       `Reconnect attempts: ${botState.reconnectAttempts}`,
       `Connected: ${botState.connected}`,
@@ -1269,37 +1264,6 @@ function getReconnectDelay() {
 }
 
 // ============================================================
-// DNS CACHING - Avoid repeated slow DNS lookups from Render
-// ============================================================
-const dnsCache = new Map();
-const DNS_CACHE_TTL = 5 * 60 * 1000; // 5 minutes
-
-function resolveHost(hostname) {
-  return new Promise((resolve, reject) => {
-    const cached = dnsCache.get(hostname);
-    if (cached && Date.now() - cached.time < DNS_CACHE_TTL) {
-      addLog(`[DNS] Using cached IP: ${hostname} → ${cached.ip}`);
-      resolve(cached.ip);
-      return;
-    }
-
-    addLog(`[DNS] Resolving ${hostname}...`);
-    dns.resolve4(hostname, (err, addresses) => {
-      if (err) {
-        addLog(`[DNS] Resolution failed for ${hostname}: ${err.code}`);
-        reject(err);
-        return;
-      }
-      const ip = addresses[0];
-      dnsCache.set(hostname, { ip, time: Date.now() });
-      addLog(`[DNS] Resolved ${hostname} → ${ip}`);
-      botState.lastResolvedIP = ip;
-      resolve(ip);
-    });
-  });
-}
-
-// ============================================================
 // PRE-FLIGHT CONNECTIVITY CHECK - Detect unreachable servers fast
 // ============================================================
 function checkConnectivity(host, port, timeoutMs = 10000) {
@@ -1347,39 +1311,27 @@ function createBot() {
   addLog(`[Bot] Creating bot instance...`);
   addLog(`[Bot] Connecting to ${config.server.ip}:${config.server.port}`);
 
-  // Resolve DNS + pre-flight check before creating the bot
-  resolveHost(config.server.ip)
-    .then((resolvedIP) => {
-      return checkConnectivity(resolvedIP, config.server.port, 10000).then(
-        (result) => {
-          addLog(
-            `[Connectivity] Server reachable — ${result.host}:${result.port} (${result.latency}ms)`,
-          );
-          return resolvedIP;
-        },
-        (err) => {
-          addLog(
-            `[Connectivity] Cannot reach ${resolvedIP}:${config.server.port} — ${err.message}`,
-          );
-          addLog(
-            `[Connectivity] Server may be unreachable from this network. Check server status and firewall.`,
-          );
-          botState.consecutiveTimeouts++;
-          scheduleReconnect();
-          throw err; // prevent createBot from proceeding
-        },
+  // Pre-flight check before creating the bot
+  checkConnectivity(config.server.ip, config.server.port, 10000)
+    .then((result) => {
+      addLog(
+        `[Connectivity] Server reachable — ${result.host}:${result.port} (${result.latency}ms)`,
       );
+      createBotConnection();
     })
-    .then((resolvedIP) => {
-      botState.lastResolvedIP = resolvedIP;
-      createBotConnection(resolvedIP);
-    })
-    .catch(() => {
-      // Pre-flight check failed, scheduleReconnect already called
+    .catch((err) => {
+      addLog(
+        `[Connectivity] Cannot reach ${config.server.ip}:${config.server.port} — ${err.message}`,
+      );
+      addLog(
+        `[Connectivity] Server may be unreachable from this network. Check server status and firewall.`,
+      );
+      botState.consecutiveTimeouts++;
+      scheduleReconnect();
     });
 }
 
-function createBotConnection(resolvedIP) {
+function createBotConnection() {
   try {
     // FIX: use version:false to auto-detect server version so the bot can join any server.
     // If the user explicitly sets a version in settings.json it is still respected.
@@ -1391,7 +1343,7 @@ function createBotConnection(resolvedIP) {
       username: config["bot-account"].username,
       password: config["bot-account"].password || undefined,
       auth: config["bot-account"].type,
-      host: resolvedIP,
+      host: config.server.ip,
       port: config.server.port,
       version: botVersion,
       hideErrors: false,
