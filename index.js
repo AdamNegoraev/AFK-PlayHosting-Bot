@@ -8,6 +8,8 @@ const config = require("./settings.json");
 const express = require("express");
 const http = require("http");
 const https = require("https");
+const net = require("net");
+const dns = require("dns");
 
 // ============================================================
 // EXPRESS SERVER - Keep Render/Aternos alive
@@ -24,6 +26,8 @@ let botState = {
   startTime: Date.now(),
   errors: [],
   wasThrottled: false,
+  consecutiveTimeouts: 0,
+  lastResolvedIP: null,
 };
 
 // Health check endpoint for monitoring
@@ -815,6 +819,8 @@ app.get("/logs", (req, res) => {
               { name: '/help',   desc: 'Show all available commands' },
               { name: '/pos',    desc: "Show bot's current coordinates" },
               { name: '/status', desc: 'Show connection status & uptime' },
+              { name: '/check',  desc: 'Test server connectivity' },
+              { name: '/debug',  desc: 'Show diagnostic info' },
               { name: '/list',   desc: 'List players on the server' },
               { name: '/say',    desc: 'Send a chat message in-game' },
             ];
@@ -1013,6 +1019,8 @@ app.post("/command", express.json(), (req, res) => {
       "  /help          - Show this help message",
       "  /pos           - Show bot's current coordinates",
       "  /status        - Show bot connection status",
+      "  /check         - Test server connectivity",
+      "  /debug         - Show diagnostic info (IP, timeouts, errors)",
       "  /list          - Ask server for player list",
       "  /say <message> - Send a chat message in-game",
       "  /<anything>    - Send any Minecraft command directly",
@@ -1036,6 +1044,42 @@ app.post("/command", express.json(), (req, res) => {
     const uptime = Math.floor((Date.now() - botState.startTime) / 1000);
     const msg = `Status: ${status} | Uptime: ${uptime}s | Reconnects: ${botState.reconnectAttempts}`;
     addLog(`[Console] ${msg}`);
+    return res.json({ success: true, msg });
+  }
+
+  if (cmd === "/check") {
+    addLog("[Console] Running connectivity check...");
+    const host = config.server.ip;
+    const port = config.server.port;
+    resolveHost(host)
+      .then((ip) => {
+        return checkConnectivity(ip, port, 10000).then((result) => {
+          const msg = `Reachable: ${result.host}:${result.port} (${result.latency}ms) | IP: ${ip}`;
+          addLog(`[Console] ${msg}`);
+          return res.json({ success: true, msg });
+        });
+      })
+      .catch((err) => {
+        const msg = `UNREACHABLE: ${host}:${port} — ${err.message}`;
+        addLog(`[Console] ${msg}`);
+        return res.json({ success: false, msg });
+      });
+    return;
+  }
+
+  if (cmd === "/debug") {
+    const lines = [
+      `Resolved IP: ${botState.lastResolvedIP || "none"}`,
+      `Consecutive timeouts: ${botState.consecutiveTimeouts}`,
+      `Reconnect attempts: ${botState.reconnectAttempts}`,
+      `Connected: ${botState.connected}`,
+      `Last 5 errors:`,
+      ...botState.errors.slice(-5).map(
+        (e) => `  ${e.type}: ${e.message || e.reason || "?"} (${new Date(e.time).toLocaleTimeString()})`,
+      ),
+    ];
+    const msg = lines.join("\n");
+    lines.forEach((l) => addLog(`[Console] ${l}`));
     return res.json({ success: true, msg });
   }
 
@@ -1087,7 +1131,7 @@ function formatUptime(seconds) {
 // SELF-PING - Prevent Render from sleeping
 // FIX: only ping if RENDER_EXTERNAL_URL is set (skip useless localhost ping)
 // ============================================================
-const SELF_PING_INTERVAL = 10 * 60 * 1000;
+const SELF_PING_INTERVAL = 5 * 60 * 1000; // 5 min — safer margin for Render's 15-min sleep
 
 function startSelfPing() {
   const renderUrl = process.env.RENDER_EXTERNAL_URL;
@@ -1097,17 +1141,30 @@ function startSelfPing() {
     );
     return;
   }
-  setInterval(() => {
+
+  function doPing(retryOnFail) {
     const protocol = renderUrl.startsWith("https") ? https : http;
-    protocol
-      .get(`${renderUrl}/ping`, (res) => {
-        // Silent success
-      })
-      .on("error", (err) => {
-        addLog(`[KeepAlive] Self-ping failed: ${err.message}`);
-      });
-  }, SELF_PING_INTERVAL);
-  addLog("[KeepAlive] Self-ping system started (every 10 min)");
+    const req = protocol.get(`${renderUrl}/ping`, (res) => {
+      // Silent success
+      res.resume();
+    });
+    req.setTimeout(10000, () => {
+      req.destroy();
+      addLog("[KeepAlive] Self-ping timed out");
+      if (retryOnFail) {
+        setTimeout(() => doPing(false), 30000);
+      }
+    });
+    req.on("error", (err) => {
+      addLog(`[KeepAlive] Self-ping failed: ${err.message}`);
+      if (retryOnFail) {
+        setTimeout(() => doPing(false), 30000);
+      }
+    });
+  }
+
+  setInterval(() => doPing(true), SELF_PING_INTERVAL);
+  addLog("[KeepAlive] Self-ping system started (every 5 min)");
 }
 
 startSelfPing();
@@ -1191,6 +1248,15 @@ function getReconnectDelay() {
     return throttleDelay;
   }
 
+  // FIX: after 5+ consecutive ETIMEDOUT failures, slow down to 5 min retries
+  if (botState.consecutiveTimeouts >= 5) {
+    const slowDelay = 300000 + Math.floor(Math.random() * 60000);
+    addLog(
+      `[Bot] ${botState.consecutiveTimeouts}+ consecutive connection timeouts — retrying in ${Math.floor(slowDelay / 1000)}s`,
+    );
+    return slowDelay;
+  }
+
   // FIX: read auto-reconnect-delay from settings as base delay
   const baseDelay = config.utils["auto-reconnect-delay"] || 3000;
   const maxDelay = config.utils["max-reconnect-delay"] || 30000;
@@ -1200,6 +1266,64 @@ function getReconnectDelay() {
   );
   const jitter = Math.floor(Math.random() * 2000);
   return delay + jitter;
+}
+
+// ============================================================
+// DNS CACHING - Avoid repeated slow DNS lookups from Render
+// ============================================================
+const dnsCache = new Map();
+const DNS_CACHE_TTL = 5 * 60 * 1000; // 5 minutes
+
+function resolveHost(hostname) {
+  return new Promise((resolve, reject) => {
+    const cached = dnsCache.get(hostname);
+    if (cached && Date.now() - cached.time < DNS_CACHE_TTL) {
+      addLog(`[DNS] Using cached IP: ${hostname} → ${cached.ip}`);
+      resolve(cached.ip);
+      return;
+    }
+
+    addLog(`[DNS] Resolving ${hostname}...`);
+    dns.resolve4(hostname, (err, addresses) => {
+      if (err) {
+        addLog(`[DNS] Resolution failed for ${hostname}: ${err.code}`);
+        reject(err);
+        return;
+      }
+      const ip = addresses[0];
+      dnsCache.set(hostname, { ip, time: Date.now() });
+      addLog(`[DNS] Resolved ${hostname} → ${ip}`);
+      botState.lastResolvedIP = ip;
+      resolve(ip);
+    });
+  });
+}
+
+// ============================================================
+// PRE-FLIGHT CONNECTIVITY CHECK - Detect unreachable servers fast
+// ============================================================
+function checkConnectivity(host, port, timeoutMs = 10000) {
+  return new Promise((resolve, reject) => {
+    const start = Date.now();
+    const socket = new net.Socket();
+    const timer = setTimeout(() => {
+      socket.destroy();
+      reject(new Error(`TCP connect to ${host}:${port} timed out after ${timeoutMs}ms`));
+    }, timeoutMs);
+
+    socket.connect(port, host, () => {
+      const latency = Date.now() - start;
+      clearTimeout(timer);
+      socket.destroy();
+      resolve({ host, port, latency });
+    });
+
+    socket.on("error", (err) => {
+      clearTimeout(timer);
+      socket.destroy();
+      reject(err);
+    });
+  });
 }
 
 function createBot() {
@@ -1223,6 +1347,39 @@ function createBot() {
   addLog(`[Bot] Creating bot instance...`);
   addLog(`[Bot] Connecting to ${config.server.ip}:${config.server.port}`);
 
+  // Resolve DNS + pre-flight check before creating the bot
+  resolveHost(config.server.ip)
+    .then((resolvedIP) => {
+      return checkConnectivity(resolvedIP, config.server.port, 10000).then(
+        (result) => {
+          addLog(
+            `[Connectivity] Server reachable — ${result.host}:${result.port} (${result.latency}ms)`,
+          );
+          return resolvedIP;
+        },
+        (err) => {
+          addLog(
+            `[Connectivity] Cannot reach ${resolvedIP}:${config.server.port} — ${err.message}`,
+          );
+          addLog(
+            `[Connectivity] Server may be unreachable from this network. Check server status and firewall.`,
+          );
+          botState.consecutiveTimeouts++;
+          scheduleReconnect();
+          throw err; // prevent createBot from proceeding
+        },
+      );
+    })
+    .then((resolvedIP) => {
+      botState.lastResolvedIP = resolvedIP;
+      createBotConnection(resolvedIP);
+    })
+    .catch(() => {
+      // Pre-flight check failed, scheduleReconnect already called
+    });
+}
+
+function createBotConnection(resolvedIP) {
   try {
     // FIX: use version:false to auto-detect server version so the bot can join any server.
     // If the user explicitly sets a version in settings.json it is still respected.
@@ -1234,11 +1391,11 @@ function createBot() {
       username: config["bot-account"].username,
       password: config["bot-account"].password || undefined,
       auth: config["bot-account"].type,
-      host: config.server.ip,
+      host: resolvedIP,
       port: config.server.port,
       version: botVersion,
       hideErrors: false,
-      checkTimeoutInterval: 600000,
+      checkTimeoutInterval: 120000,
     });
 
     bot.loadPlugin(pathfinder);
@@ -1273,7 +1430,7 @@ function createBot() {
         bot = null;
         scheduleReconnect();
       }
-    }, 150000); // 150s - Aternos servers can take 90-120s to finish spawning a player
+    }, 60000); // 60s - fail fast if server is unreachable
 
     // FIX: guard against spawn firing twice (can happen on some servers)
     let spawnHandled = false;
@@ -1286,6 +1443,7 @@ function createBot() {
       botState.connected = true;
       botState.lastActivity = Date.now();
       botState.reconnectAttempts = 0;
+      botState.consecutiveTimeouts = 0;
       isReconnecting = false;
 
       addLog(
@@ -1393,6 +1551,12 @@ function createBot() {
       const msg = err.message || "";
       addLog(`[Bot] Error: ${msg}`);
       botState.errors.push({ type: "error", message: msg, time: Date.now() });
+      if (msg.includes("ETIMEDOUT") || msg.includes("timed out")) {
+        botState.consecutiveTimeouts++;
+        addLog(
+          `[Bot] Connection timeout (#${botState.consecutiveTimeouts} consecutive)`,
+        );
+      }
       // Don't reconnect on error - let 'end' event handle it
     });
   } catch (err) {
@@ -2089,11 +2253,25 @@ process.on("unhandledRejection", (reason) => {
 });
 
 process.on("SIGTERM", () => {
-  addLog("[System] SIGTERM received — ignoring, bot will stay alive.");
+  addLog("[System] SIGTERM received — shutting down gracefully...");
+  if (bot) {
+    try { bot.end(); } catch (_) {}
+    bot = null;
+  }
+  clearAllIntervals();
+  clearBotTimeouts();
+  process.exit(0);
 });
 
 process.on("SIGINT", () => {
-  addLog("[System] SIGINT received — ignoring, bot will stay alive.");
+  addLog("[System] SIGINT received — shutting down gracefully...");
+  if (bot) {
+    try { bot.end(); } catch (_) {}
+    bot = null;
+  }
+  clearAllIntervals();
+  clearBotTimeouts();
+  process.exit(0);
 });
 
 // =============================
